@@ -1,1 +1,174 @@
+import os
+import json
+import time
+import asyncio
+import threading
+import discord
+from discord import app_commands
+from discord.ext import commands
+from flask import Flask
 
+# ── Flask (keeps bot alive via UptimeRobot) ─────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "bot is online"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# ── Trigger storage (JSON file) ──────────────────────────────────────────────
+TRIGGERS_FILE = "triggers.json"
+
+def load_triggers():
+    if os.path.exists(TRIGGERS_FILE):
+        with open(TRIGGERS_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_triggers(triggers):
+    with open(TRIGGERS_FILE, "w") as f:
+        json.dump(triggers, f, indent=2)
+
+# ── Discord bot setup ─────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True  # BẮT BUỘC để bot nhận biết user đang ở voice channel nào
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Deduplication cache for triggers
+processed_messages = {}
+CACHE_DURATION = 3.0
+
+def is_duplicate(message_id: str) -> bool:
+    now = time.time()
+    expired = [k for k, v in processed_messages.items() if now - v > CACHE_DURATION * 2]
+    for k in expired:
+        del processed_messages[k]
+    if message_id in processed_messages and now - processed_messages[message_id] < CACHE_DURATION:
+        return True
+    processed_messages[message_id] = now
+    return False
+
+@bot.event
+async def on_ready():
+    print(f"✅ Bot ready as {bot.user}")
+    try:
+        synced = await bot.tree.sync()
+        print(f" Global commands registered: {len(synced)}")
+        for guild in bot.guilds:
+            await bot.tree.sync(guild=guild)
+            print(f"📋 Synced to guild: {guild.name}")
+    except Exception as e:
+        print(f"❌ Failed to register commands: {e}")
+
+# ── /joinvoice command ────────────────────────────────────────────────────────
+@bot.tree.command(name="joinvoice", description="Bot tham gia kênh thoại của bạn")
+async def joinvoice(interaction: discord.Interaction):
+    if interaction.user.voice is None or interaction.user.voice.channel is None:
+        await interaction.response.send_message(
+            "❌ Bạn cần tham gia một kênh thoại trước khi dùng lệnh này!", 
+            ephemeral=True
+        )
+        return
+
+    target_channel = interaction.user.voice.channel
+    guild = interaction.guild
+
+    try:
+        if guild.voice_client is not None:
+            await guild.voice_client.move_to(target_channel)
+            await interaction.response.send_message(f"🔄 Bot đã di chuyển sang **{target_channel.name}**!")
+        else:
+            await target_channel.connect()
+            await interaction.response.send_message(f"✅ Bot đã tham gia **{target_channel.name}**! 🎤")
+    except Exception as e:
+        await interaction.response.send_message(f"️ Lỗi kết nối: {str(e)}", ephemeral=True)
+
+# ── /leave command (Bonus: giúp bot rời kênh thoại) ───────────────────────────
+@bot.tree.command(name="leave", description="Bot rời khỏi kênh thoại hiện tại")
+async def leave(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc is None:
+        await interaction.response.send_message("❌ Bot hiện không ở trong kênh thoại nào!", ephemeral=True)
+        return
+    
+    await vc.disconnect()
+    await interaction.response.send_message("👋 Bot đã rời khỏi kênh thoại!")
+
+# ── Existing trigger commands (/addtrigger, /removetrigger, etc.) ─────────────
+@bot.tree.command(name="addtrigger", description="Add a new auto-response trigger")
+@app_commands.describe(word="Word to trigger on", response="Bot reply message")
+async def addtrigger(interaction: discord.Interaction, word: str, response: str):
+    triggers = load_triggers()
+    if any(t["word"].lower() == word.lower() for t in triggers):
+        await interaction.response.send_message(f"⚠️ Trigger already exists: **{word}**", ephemeral=True)
+        return
+    triggers.append({"word": word, "response": response, "active": True})
+    save_triggers(triggers)
+    await interaction.response.send_message(f"✅ Added: **{word}** → *{response}*", ephemeral=True)
+
+@bot.tree.command(name="removetrigger", description="Remove an existing trigger")
+@app_commands.describe(word="Trigger word to remove")
+async def removetrigger(interaction: discord.Interaction, word: str):
+    triggers = load_triggers()
+    new_triggers = [t for t in triggers if t["word"].lower() != word.lower()]
+    if len(new_triggers) == len(triggers):
+        await interaction.response.send_message(f"❌ Not found: **{word}**", ephemeral=True)
+        return
+    save_triggers(new_triggers)
+    await interaction.response.send_message(f"🗑️ Removed: **{word}**", ephemeral=True)
+
+@bot.tree.command(name="edittrigger", description="Edit an existing trigger response")
+@app_commands.describe(word="Trigger word to edit", response="New reply message")
+async def edittrigger(interaction: discord.Interaction, word: str, response: str):
+    triggers = load_triggers()
+    for t in triggers:
+        if t["word"].lower() == word.lower():
+            t["response"] = response
+            save_triggers(triggers)
+            await interaction.response.send_message(f"✏️ Updated: **{word}** → *{response}*", ephemeral=True)
+            return
+    await interaction.response.send_message(f"❌ Not found: **{word}**", ephemeral=True)
+
+@bot.tree.command(name="triggerlist", description="List all configured triggers")
+async def triggerlist(interaction: discord.Interaction):
+    triggers = load_triggers()
+    if not triggers:
+        await interaction.response.send_message("📭 No triggers yet. Use `/addtrigger`!", ephemeral=True)
+        return
+    lines = [f"• **{t['word']}**: {t['response']}{'' if t.get('active', True) else ' (Disabled)'}" for t in triggers]
+    await interaction.response.send_message("**Triggers:**\n" + "\n".join(lines), ephemeral=True)
+
+# ── Message trigger listener ──────────────────────────────────────────────────
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.content.startswith("/"):
+        return
+    if is_duplicate(str(message.id)):
+        return
+
+    triggers = load_triggers()
+    lower = message.content.lower()
+    for t in triggers:
+        if t.get("active", True) and t["word"].lower() in lower:
+            await message.reply(t["response"])
+            return
+
+    await bot.process_commands(message)
+
+# ── Start bot & Flask ─────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    token = os.environ.get("DISCORD_TOKEN")
+    if not token:
+        print("❌ DISCORD_TOKEN not set!")
+    else:
+        bot.run(token)
